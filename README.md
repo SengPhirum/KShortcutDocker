@@ -8,6 +8,7 @@ Reusable Docker Swarm stack scripts behind a single global command, `ksd`:
 - `ksd log`     -> `log.sh`
 - `ksd network` -> `network.sh`
 - `ksd update`  -> `update.sh`
+- `ksd uninstall` -> `uninstall.sh`
 
 These commands run against your current working directory, so you can use them
 in any folder that contains `docker-compose.yml`, `docker-compose-prd.yml`, or
@@ -91,13 +92,14 @@ What `install.sh` does:
 ## Autocomplete
 
 ```sh
-ksd <TAB>              # lists: config deploy stop log network update
+ksd <TAB>              # lists: config deploy stop log network update uninstall
 ksd deploy <TAB>       # suggest -f, --force, -c, --compose-file, -s, --stack, -a, --all
 ksd deploy -c <TAB>    # suggest .yml/.yaml files
 ksd deploy --stack <TAB>  # suggest stack names from first-level folders
 ksd log <TAB>          # suggest available services
 ksd log api <TAB>      # suggest common line counts
 ksd network <TAB>      # suggest ensure/update/check and options
+ksd uninstall <TAB>    # suggest --bashrc, --keep-source, -y, --yes, --help
 ```
 
 ## Examples
@@ -122,3 +124,18 @@ Updating later is just:
 ```sh
 ksd update
 ```
+
+## Uninstall
+
+```sh
+ksd uninstall
+```
+
+This removes the `ksd` command (and any leftover wrappers from earlier
+versions of this tool) from every `PATH` directory it was installed in, its
+completion file(s), and the PATH/completion lines it added to `~/.bashrc`
+(a backup of the original file is kept alongside it). If this was a quick
+install, it also deletes the cloned source in `~/.ksd`.
+
+Skip the confirmation prompt with `-y`/`--yes`, or keep the cloned source
+around with `--keep-source`.

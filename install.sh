@@ -188,6 +188,7 @@ require_script "stop.sh"
 require_script "log.sh"
 require_script "network.sh"
 require_script "update.sh"
+require_script "uninstall.sh"
 
 mkdir -p "$BIN_DIR"
 
@@ -400,6 +401,34 @@ _ksd_config_completion() {
   esac
 }
 
+_ksd_uninstall_completion() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  case "$prev" in
+    --bashrc)
+      COMPREPLY=( $(compgen -f -- "$cur") )
+      return 0
+      ;;
+  esac
+
+  case "$cur" in
+    --*)
+      _ksd_match_words "$cur" --bashrc --keep-source --yes --help
+      return 0
+      ;;
+    -*)
+      _ksd_match_words "$cur" -y -h --bashrc --keep-source --yes --help
+      return 0
+      ;;
+    "")
+      COMPREPLY=(-y --yes --bashrc --keep-source -h --help)
+      return 0
+      ;;
+  esac
+}
+
 _ksd_log_completion() {
   local cur services
   cur="${COMP_WORDS[COMP_CWORD]}"
@@ -573,7 +602,7 @@ _ksd_completion() {
   fi
 
   if [ "$COMP_CWORD" -eq 1 ]; then
-    _ksd_match_words "$cur" config deploy stop log network update -h --help
+    _ksd_match_words "$cur" config deploy stop log network update uninstall -h --help
     return 0
   fi
 
@@ -590,6 +619,9 @@ _ksd_completion() {
       ;;
     network)
       _ksd_network_completion
+      ;;
+    uninstall)
+      _ksd_uninstall_completion
       ;;
     *)
       COMPREPLY=()

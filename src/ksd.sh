@@ -14,6 +14,7 @@ Commands:
   log       Tail logs for a service in the current stack
   network   Ensure, update, or check Docker networks
   update    Update ksd to the latest version
+  uninstall Remove ksd and everything install.sh created
 
 Run 'ksd <command> --help' for command-specific options.
 Run 'ksd <TAB>' for command completion (after enabling ksd completion).
@@ -43,6 +44,9 @@ case "$cmd" in
     ;;
   update)
     exec sh "$SCRIPT_DIR/update.sh" "$@"
+    ;;
+  uninstall)
+    exec sh "$SCRIPT_DIR/uninstall.sh" "$@"
     ;;
   -h|--help)
     print_help
