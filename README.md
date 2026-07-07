@@ -25,7 +25,9 @@ armored multi-line keys such as `.asc` or `.pem` files directly at the prompt.
 uses a secret/config that is not defined with `file:` or `external:`, it
 prompts for the missing value, creates a Docker Swarm resource named
 `<stack>_<name>`, and deploys with a temporary normalized compose file that
-points to that external resource.
+points to that external resource. For `external: true` resources, a missing
+Docker resource is created with the external name itself, such as
+`POSTGRES_PASSWORD`.
 
 `ksd deploy` also supports parent-folder batch deploy mode: if the current
 folder does not contain a compose file, it scans first-level child folders for

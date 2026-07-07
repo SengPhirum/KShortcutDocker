@@ -365,10 +365,10 @@ ensure_swarm_resource() {
 
   while true; do
     if [ "$resource_section" = "secrets" ]; then
-      printf "  %s %s: " "$label" "$resource_name" >&2
+      printf "  Enter %s value to create %s: " "$label" "$external_name" >&2
       value="$(read_hidden_secret_value)"
     else
-      printf "  %s %s: " "$label" "$resource_name" >&2
+      printf "  Enter %s value to create %s: " "$label" "$external_name" >&2
       value="$(read_visible_resource_value)"
       echo >&2
     fi
@@ -383,7 +383,7 @@ ensure_swarm_resource() {
       return 1
     fi
 
-    echo "    Required (Docker $label does not exist)." >&2
+    echo "    Required (Docker $label '$external_name' does not exist)." >&2
   done
 }
 
@@ -703,6 +703,10 @@ prepare_compose_for_deploy() {
             *) external_name="$external_value" ;;
           esac
         fi
+        if [ -z "$external_name" ]; then
+          external_name="$resource_name"
+        fi
+        ensure_swarm_resource "$resource_section" "$resource_name" "$external_name"
         printf '%s\t%s\texternal\t%s\n' "$resource_section" "$resource_name" "$external_name" >> "$defs_file"
         continue
       fi
