@@ -451,13 +451,17 @@ _ksd_network_completion() {
   local cword=$(( COMP_CWORD - 1 ))
   local cur prev mode subcommand word
   local -a subcommand_words ensure_short_words ensure_long_words ensure_all_words
+  local -a create_short_words create_long_words create_all_words
   local -a update_short_words update_long_words update_all_words
   local -a check_short_words check_long_words check_all_words
 
-  subcommand_words=(ensure update check)
+  subcommand_words=(create ensure update check)
   ensure_short_words=(-f -v -h)
   ensure_long_words=(--file --stack-name --verbose --help)
   ensure_all_words=(-f --file --stack-name -v --verbose -h --help)
+  create_short_words=(-d -s -v -h)
+  create_long_words=(--driver --size --subnet --gateway --encrypted --internal --yes --verbose --help)
+  create_all_words=(-d --driver -s --size --subnet --gateway --encrypted --internal --yes -v --verbose -h --help)
   update_short_words=(-v -h --yes)
   update_long_words=(--subnet --gateway --temp-network --network --yes --verbose --help)
   update_all_words=(--subnet --gateway --temp-network --network --yes -v --verbose -h --help)
@@ -482,7 +486,7 @@ _ksd_network_completion() {
   mode="$subcommand"
 
   case "$mode" in
-    ensure|update|check|check-subnet|migrate-subnet)
+    create|ensure|update|check|check-subnet|migrate-subnet)
       ;;
     *)
       mode="ensure"
@@ -511,6 +515,14 @@ _ksd_network_completion() {
       _ksd_complete_compose_file "$cur"
       return 0
       ;;
+    -d|--driver)
+      _ksd_match_words "$cur" overlay bridge
+      return 0
+      ;;
+    -s|--size)
+      _ksd_match_words "$cur" auto /24 /23 /22 /21 /20 /16
+      return 0
+      ;;
     --network|--temp-network)
       _ksd_complete_networks "$cur"
       return 0
@@ -532,7 +544,27 @@ _ksd_network_completion() {
     mode="check"
   fi
 
-  if [ "$mode" = "update" ]; then
+  if [ "$mode" = "create" ]; then
+    if [ "$cword" -eq 2 ] && [[ "$cur" != -* ]]; then
+      # A new network name: nothing to suggest.
+      return 0
+    fi
+
+    case "$cur" in
+      --*)
+        _ksd_match_words "$cur" "${create_long_words[@]}"
+        ;;
+      -*)
+        _ksd_match_words "$cur" "${create_short_words[@]}"
+        ;;
+      "")
+        COMPREPLY=("${create_all_words[@]}")
+        ;;
+      *)
+        COMPREPLY=()
+        ;;
+    esac
+  elif [ "$mode" = "update" ]; then
     if [ "$cword" -eq 2 ] && [[ "$cur" != -* ]]; then
       _ksd_complete_networks "$cur"
       return 0

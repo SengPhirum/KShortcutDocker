@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu  # works in sh and bash
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 HOSTNAME="$(hostname 2>/dev/null || true)"
 CURRENT_DIR="$(pwd)"
 RESOLVE_IMAGE=""
@@ -27,6 +28,8 @@ Behavior:
   - In a stack folder, deploys the current folder as before.
   - In a parent folder, scans first-level child folders for docker-compose*.yml,
     lets you select stack names, then runs batch deploy sequentially.
+  - Before deploying, checks the 'external: true' networks used by the stack;
+    a missing one is created after asking for its driver mode and subnet size.
 EOF
 }
 
@@ -271,7 +274,9 @@ armored_block_end_line() {
 }
 
 use_prompt_tty() {
-  [ "${KSDD_PROMPT_STDIN:-0}" != "1" ] && [ -r /dev/tty ] && [ -w /dev/tty ]
+  # Try opening /dev/tty: without a controlling terminal (CI, cron) it still
+  # passes -r/-w permission checks, but every read from it fails.
+  [ "${KSDD_PROMPT_STDIN:-0}" != "1" ] && (: < /dev/tty) 2>/dev/null
 }
 
 read_hidden_secret_value() {
@@ -739,6 +744,276 @@ prepare_compose_for_deploy() {
   rm -rf "$records_dir"
 }
 
+# Prints "<compose key>|<docker network name>" for each top-level network with
+# external: true that a service uses (a service without networks uses "default"),
+# matching what docker stack deploy requires to exist.
+collect_compose_external_networks() {
+  compose_file="$1"
+
+  awk '
+    function trim(s) { sub(/^[ \t\r\n]+/, "", s); sub(/[ \t\r\n]+$/, "", s); return s }
+    function indent(s, tmp) { tmp=s; sub(/[^ ].*$/, "", tmp); return length(tmp) }
+    function clean_value(s) {
+      s=trim(s)
+      sub(/[[:space:]]+#.*$/, "", s)
+      if ((s ~ /^".*"$/) || (s ~ /^'\''.*'\''$/)) {
+        s=substr(s, 2, length(s) - 2)
+      }
+      return s
+    }
+    function key_of(s) { sub(/:.*/, "", s); return clean_value(s) }
+    function value_of(s) {
+      if (s !~ /:/) return ""
+      sub(/^[^:]*:/, "", s)
+      return clean_value(s)
+    }
+    function flow_value(text, wanted, n, i, parts) {
+      sub(/^\{/, "", text)
+      sub(/\}[[:space:]]*$/, "", text)
+      n=split(text, parts, ",")
+      for (i=1; i<=n; i++) {
+        if (key_of(parts[i]) == wanted) return value_of(parts[i])
+      }
+      return ""
+    }
+    # Supports $VAR, ${VAR}, ${VAR:-default} and ${VAR-default}; anything else is
+    # left in place, so the caller can tell the name could not be resolved.
+    function interpolate(s, out, i, rest, close_at, expr, var, op, is_set, val) {
+      out=""
+      while ((i=index(s, "$")) > 0) {
+        out=out substr(s, 1, i - 1)
+        rest=substr(s, i + 1)
+        if (rest ~ /^\{[A-Za-z_][A-Za-z0-9_]*(:?-[^}]*)?\}/) {
+          close_at=index(rest, "}")
+          expr=substr(rest, 2, close_at - 2)
+          match(expr, /^[A-Za-z_][A-Za-z0-9_]*/)
+          var=substr(expr, 1, RLENGTH)
+          op=substr(expr, RLENGTH + 1)
+          s=substr(rest, close_at + 1)
+        } else if (match(rest, /^[A-Za-z_][A-Za-z0-9_]*/)) {
+          var=substr(rest, 1, RLENGTH)
+          op=""
+          s=substr(rest, RLENGTH + 1)
+        } else {
+          return out "$" rest
+        }
+        is_set=(var in ENVIRON)
+        val=is_set ? ENVIRON[var] : ""
+        if (op ~ /^:-/ && val == "") val=substr(op, 3)
+        else if (op ~ /^-/ && !is_set) val=substr(op, 2)
+        out=out val
+      }
+      return out s
+    }
+    function is_true(v) { return v ~ /^(true|True|TRUE|yes|Yes|YES|on|On|ON)$/ }
+    function set_external(value) {
+      value=interpolate(value)
+      if (value ~ /^\{/) {
+        net_external=1
+        external_name=flow_value(value, "name")
+      } else if (is_true(value)) {
+        net_external=1
+      }
+    }
+    function flush_network(name) {
+      if (net_key != "" && net_external) {
+        name=interpolate(net_name != "" ? net_name : external_name)
+        if (name == "") name=net_key
+        ext_count++
+        ext_keys[ext_count]=net_key
+        ext_names[ext_count]=name
+      }
+      net_key=""
+      net_name=""
+      external_name=""
+      net_external=0
+      in_external=0
+      net_field_indent=0
+    }
+    function network_line(t, ind, rest) {
+      if (!net_entry_indent) net_entry_indent=ind
+      if (ind < net_entry_indent) return
+      if (ind == net_entry_indent) {
+        flush_network()
+        net_key=key_of(t)
+        rest=value_of(t)
+        if (rest ~ /^\{/) {
+          set_external(flow_value(rest, "external"))
+          net_name=flow_value(rest, "name")
+        }
+        return
+      }
+      if (net_key == "") return
+      if (!net_field_indent) net_field_indent=ind
+      if (ind == net_field_indent) {
+        in_external=0
+        if (key_of(t) == "external") {
+          if (value_of(t) == "") in_external=1
+          else set_external(value_of(t))
+        } else if (key_of(t) == "name") {
+          net_name=value_of(t)
+        }
+      } else if (ind > net_field_indent && in_external) {
+        # Legacy block form: "external:" with a nested "name: <network>".
+        net_external=1
+        if (key_of(t) == "name") external_name=value_of(t)
+      }
+    }
+    function use_network(name) {
+      if (name != "") {
+        used[name]=1
+        service_network_count++
+      }
+    }
+    function end_service() {
+      if (in_service && service_network_count == 0) used["default"]=1
+      in_service=0
+    }
+    function use_flow_networks(text, n, i, parts) {
+      if (text ~ /^\[/) {
+        sub(/^\[/, "", text)
+        sub(/\][[:space:]]*$/, "", text)
+        n=split(text, parts, ",")
+        for (i=1; i<=n; i++) use_network(clean_value(parts[i]))
+      } else if (text ~ /^\{/) {
+        sub(/^\{/, "", text)
+        sub(/\}[[:space:]]*$/, "", text)
+        n=split(text, parts, ",")
+        for (i=1; i<=n; i++) {
+          if (parts[i] ~ /:/) use_network(key_of(parts[i]))
+        }
+      }
+    }
+    function list_item(t) { sub(/^-[[:space:]]*/, "", t); return clean_value(t) }
+    function service_line(t, ind) {
+      if (!service_entry_indent) service_entry_indent=ind
+      if (ind < service_entry_indent) return
+      if (ind == service_entry_indent) {
+        end_service()
+        in_service=1
+        service_network_count=0
+        service_field_indent=0
+        in_service_networks=0
+        service_network_indent=0
+        return
+      }
+      if (!in_service) return
+      if (!service_field_indent) service_field_indent=ind
+      if (ind == service_field_indent) {
+        # A "- name" list may sit at the same indentation as its "networks:" key.
+        if (in_service_networks && t ~ /^-/) {
+          use_network(list_item(t))
+          return
+        }
+        in_service_networks=0
+        if (key_of(t) == "networks") {
+          if (value_of(t) == "") in_service_networks=1
+          else use_flow_networks(value_of(t))
+        }
+      } else if (ind > service_field_indent && in_service_networks) {
+        if (!service_network_indent) service_network_indent=ind
+        if (ind == service_network_indent) {
+          if (t ~ /^-/) use_network(list_item(t))
+          else use_network(key_of(t))
+        }
+      }
+    }
+    {
+      raw=$0
+      sub(/\r$/, "", raw)
+      t=trim(raw)
+      if (t == "" || t ~ /^#/) {
+        next
+      }
+
+      ind=indent(raw)
+      if (ind == 0) {
+        end_service()
+        flush_network()
+        section=key_of(t)
+        net_entry_indent=0
+        service_entry_indent=0
+        next
+      }
+
+      if (section == "networks") {
+        network_line(t, ind)
+      } else if (section == "services") {
+        service_line(t, ind)
+      }
+    }
+    END {
+      end_service()
+      flush_network()
+      for (i=1; i<=ext_count; i++) {
+        if ((ext_keys[i] in used) && !(ext_names[i] in printed)) {
+          printed[ext_names[i]]=1
+          print ext_keys[i] "|" ext_names[i]
+        }
+      }
+    }
+  ' "$compose_file"
+}
+
+create_external_network() {
+  network_name="$1"
+
+  if use_prompt_tty; then
+    sh "$SCRIPT_DIR/network.sh" create "$network_name" < /dev/tty
+  elif [ "${KSDD_PROMPT_STDIN:-0}" = "1" ]; then
+    sh "$SCRIPT_DIR/network.sh" create "$network_name"
+  else
+    # Never create one unattended: a typo in a network name would otherwise
+    # deploy onto a new, empty network instead of failing.
+    echo "  No terminal to ask for its driver mode and subnet size. Create it first, e.g.:" >&2
+    echo "    ksd network create $network_name --driver overlay --size auto --yes" >&2
+    return 1
+  fi
+}
+
+ensure_external_networks() {
+  compose_file="$1"
+  external_networks="$(collect_compose_external_networks "$compose_file")"
+  [ -n "$external_networks" ] || return 0
+
+  if ! docker_networks="$(docker network ls --format '{{.Name}}|{{.Scope}}' 2>/dev/null)"; then
+    echo "Warning: could not list Docker networks; skipping the external network check." >&2
+    return 0
+  fi
+
+  # Read the list on fd 3 so stdin stays free for the create prompts.
+  while IFS='|' read -r network_key network_name <&3; do
+    [ -n "$network_key" ] || continue
+
+    case "$network_name" in
+      *'$'*)
+        echo "Skipping check of external network '$network_key': cannot resolve its name '$network_name'." >&2
+        continue
+        ;;
+    esac
+
+    network_scope="$(printf '%s\n' "$docker_networks" | awk -F '|' -v name="$network_name" '$1 == name { print $2; exit }')"
+    if [ -n "$network_scope" ]; then
+      echo "Docker network exists: $network_name" >&2
+      if [ "$network_scope" != "swarm" ]; then
+        case "$network_name" in
+          host|bridge|none) ;;
+          *) echo "Warning: Docker network '$network_name' has scope '$network_scope'; docker stack deploy needs a swarm-scoped network." >&2 ;;
+        esac
+      fi
+      continue
+    fi
+
+    echo "Missing Docker network '$network_name' for compose network '$network_key'." >&2
+    if ! create_external_network "$network_name"; then
+      echo "Error: Docker network '$network_name' is required by this stack but was not created." >&2
+      return 1
+    fi
+  done 3<<EOF
+$external_networks
+EOF
+}
+
 deploy_stack_dir() {
   target_dir="$1"
   stack_name="$(basename "$target_dir")"
@@ -770,6 +1045,7 @@ deploy_stack_dir() {
       fi
     fi
 
+    ensure_external_networks "$RESOLVED_COMPOSE_FILE"
     prepare_compose_for_deploy "$RESOLVED_COMPOSE_FILE" "$stack_name"
 
     if [ -n "$RESOLVE_IMAGE" ]; then

@@ -8,12 +8,14 @@ exec 3>&2
 #   1) Ensure all networks declared in a Docker Compose file exist.
 #   2) Recreate an existing Docker network after detaching all services and containers.
 #   3) Inspect subnet usage and available IPs for Docker networks.
+#   4) Create one network, asking for its driver mode and subnet size.
 #
 # Usage:
 #   ./network.sh [ensure-options]
 #   ./network.sh ensure [ensure-options]
 #   ./network.sh update <network-name> [update-options]
 #   ./network.sh check [network-name-or-regex] [check-options]
+#   ./network.sh create <network-name> [create-options]
 
 usage_all() {
   cat <<'EOF'
@@ -23,11 +25,13 @@ Usage:
   ./network.sh update <network-name> [update-options]
   ./network.sh check [network-name-or-regex] [check-options]
   ./network.sh check-subnet [check-options]   # backward-compatible alias
+  ./network.sh create <network-name> [create-options]
 
 Purpose:
   1) Check and create all networks from docker-compose if missing.
   2) Recreate an existing network after detaching all services and containers.
   3) Check subnet usage (used/available IPs) for Docker networks.
+  4) Create one network, asking for its driver mode and subnet size.
 
 Ensure options:
   -f, --file FILE         Compose file to read (default: docker-compose.yml)
@@ -53,9 +57,26 @@ Check options:
   -v, --verbose           Print each command before execution
   -h, --help              Show this help
 
+Create options (driver mode and subnet size are asked for when not given):
+  -d, --driver <driver>   overlay (default) or bridge; with Swarm active a bridge
+                          is swarm-scoped and Docker assigns its subnet per node
+  -s, --size <size>       auto (Docker assigns the subnet) or a prefix such as /24;
+                          a free subnet of that size is picked automatically
+  --subnet <CIDR>         Explicit subnet (skips the size selection)
+  --gateway <IP>          Gateway IP (requires --subnet)
+  --encrypted             Encrypt overlay traffic between nodes (IPsec)
+  --internal              Restrict external access to the network
+  --yes                   Do not prompt; use defaults for anything not given
+  -v, --verbose           Print each command before execution
+  -h, --help              Show this help
+
 Environment (ensure mode):
   DRIVER=overlay          Default driver when not set in compose
   ATTACHABLE=true         Default attachable when not set in compose
+  DRY_RUN=1               Print actions instead of executing them
+
+Environment (create mode):
+  ATTACHABLE=true         Create swarm-scoped networks as attachable
   DRY_RUN=1               Print actions instead of executing them
 EOF
 }
@@ -110,6 +131,32 @@ Check options:
   --using                 List services using each matched network
   -v, --verbose           Print each command before execution
   -h, --help              Show this help
+EOF
+}
+
+usage_create() {
+  cat <<'EOF'
+Usage:
+  ./network.sh create <network-name> [create-options]
+
+Asks for the driver mode and subnet size unless they are given as options.
+
+Create options:
+  -d, --driver <driver>   overlay (default) or bridge; with Swarm active a bridge
+                          is swarm-scoped and Docker assigns its subnet per node
+  -s, --size <size>       auto (Docker assigns the subnet) or a prefix such as /24;
+                          a free subnet of that size is picked automatically
+  --subnet <CIDR>         Explicit subnet (skips the size selection)
+  --gateway <IP>          Gateway IP (requires --subnet)
+  --encrypted             Encrypt overlay traffic between nodes (IPsec)
+  --internal              Restrict external access to the network
+  --yes                   Do not prompt; use defaults for anything not given
+  -v, --verbose           Print each command before execution
+  -h, --help              Show this help
+
+Environment (create mode):
+  ATTACHABLE=true         Create swarm-scoped networks as attachable
+  DRY_RUN=1               Print actions instead of executing them
 EOF
 }
 
@@ -1331,6 +1378,328 @@ EOF
   fi
 }
 
+read_choice() {
+  printf '%s' "$1" >&2
+  CHOICE_REPLY=""
+  if ! IFS= read -r CHOICE_REPLY; then
+    # End of input: keep any partial reply; an empty reply selects the default.
+    printf '\n' >&2
+  fi
+  CHOICE_REPLY="$(printf '%s' "$CHOICE_REPLY" | tr -d '[:space:]')"
+}
+
+cidr_network_address() {
+  awk -v cidr="$1" '
+    BEGIN {
+      split(cidr, parts, "/")
+      split(parts[1], oct, ".")
+      size = 2 ^ (32 - parts[2])
+      ip = int((((oct[1] * 256 + oct[2]) * 256 + oct[3]) * 256 + oct[4]) / size) * size
+      printf "%d.%d.%d.%d/%d\n", int(ip / 16777216) % 256, int(ip / 65536) % 256, int(ip / 256) % 256, ip % 256, parts[2]
+    }
+  '
+}
+
+pick_free_subnet() {
+  _pools="$1"
+  _prefix="$2"
+  list_existing_subnets | awk -v pools="$_pools" -v prefix="$_prefix" '
+    function ip_to_int(ip, o) {
+      split(ip, o, ".")
+      return (((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4])
+    }
+    function int_to_ip(v, o1, o2, o3, o4) {
+      o1 = int(v / 16777216) % 256
+      o2 = int(v / 65536) % 256
+      o3 = int(v / 256) % 256
+      o4 = int(v) % 256
+      return o1 "." o2 "." o3 "." o4
+    }
+    /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {
+      split($0, p, "/")
+      size = 2 ^ (32 - p[2])
+      used++
+      used_start[used] = int(ip_to_int(p[1]) / size) * size
+      used_stop[used] = used_start[used] + size - 1
+    }
+    END {
+      target = prefix + 0
+      block = 2 ^ (32 - target)
+      pool_count = split(pools, pool_list, " ")
+      for (i = 1; i <= pool_count; i++) {
+        if (pool_list[i] !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/) continue
+        split(pool_list[i], p, "/")
+        if (target < p[2] + 0 || target > 32) continue
+        pool_size = 2 ^ (32 - p[2])
+        start = int(ip_to_int(p[1]) / pool_size) * pool_size
+        stop = start + pool_size - 1
+        while (start + block - 1 <= stop) {
+          # Jump past every existing subnet that overlaps this candidate block.
+          next_start = 0
+          for (j = 1; j <= used; j++) {
+            if (used_start[j] <= start + block - 1 && start <= used_stop[j]) {
+              candidate = (int(used_stop[j] / block) + 1) * block
+              if (candidate > next_start) next_start = candidate
+            }
+          }
+          if (next_start == 0) {
+            print int_to_ip(start) "/" target
+            exit
+          }
+          start = next_start
+        }
+      }
+    }
+  '
+}
+
+load_create_subnet_defaults() {
+  if [ "$CREATE_DRIVER" = "overlay" ]; then
+    # Pick from the Swarm address pool, where Docker itself allocates overlay subnets.
+    _swarm_ipam="$(docker info -f '{{if .Swarm.Cluster}}{{.Swarm.Cluster.SubnetSize}}|{{range .Swarm.Cluster.DefaultAddrPool}}{{.}} {{end}}{{end}}' 2>/dev/null || true)"
+    _swarm_subnet_size="${_swarm_ipam%%|*}"
+    CREATE_POOLS="$(printf '%s' "${_swarm_ipam#*|}" | sed 's/[[:space:]]*$//')"
+    case "$_swarm_subnet_size" in
+      ''|0|*[!0-9]*) _swarm_subnet_size="24" ;;
+    esac
+    [ -n "$CREATE_POOLS" ] || CREATE_POOLS="10.0.0.0/8"
+    CREATE_AUTO_LABEL="Let Docker assign a /${_swarm_subnet_size} from ${CREATE_POOLS}"
+  else
+    CREATE_POOLS="172.16.0.0/12 192.168.0.0/16"
+    CREATE_AUTO_LABEL="Let Docker assign one from its local address pools"
+  fi
+}
+
+# Sets NEW_SUBNET from an explicit CIDR, or from a prefix size ("/24" or "24")
+# by picking the first free subnet of that size in CREATE_POOLS.
+resolve_create_subnet() {
+  _requested="$1"
+  case "$_requested" in
+    *.*)
+      if ! is_valid_cidr "$_requested"; then
+        err "Invalid subnet: $_requested"
+        return 1
+      fi
+      _network_address="$(cidr_network_address "$_requested")"
+      if [ "$_network_address" != "$_requested" ]; then
+        err "Subnet $_requested does not start at its network address; use $_network_address"
+        return 1
+      fi
+      _conflict="$(first_conflicting_subnet "$_requested" || true)"
+      if [ -n "$_conflict" ]; then
+        err "Subnet $_requested overlaps existing subnet $_conflict."
+        return 1
+      fi
+      NEW_SUBNET="$_requested"
+      return 0
+      ;;
+  esac
+
+  _prefix="${_requested#/}"
+  case "$_prefix" in
+    ''|*[!0-9]*)
+      err "Invalid subnet size: $_requested (use auto, a prefix such as /24, or a subnet such as 10.20.0.0/22)"
+      return 1
+      ;;
+  esac
+  if [ "$_prefix" -lt 8 ] || [ "$_prefix" -gt 29 ]; then
+    err "Subnet size must be between /8 and /29: $_requested"
+    return 1
+  fi
+
+  NEW_SUBNET="$(pick_free_subnet "$CREATE_POOLS" "$_prefix")"
+  if [ -z "$NEW_SUBNET" ]; then
+    err "No free /$_prefix subnet left in $CREATE_POOLS; pass an explicit subnet instead."
+    return 1
+  fi
+  info "Picked free subnet $NEW_SUBNET (pool: $CREATE_POOLS)"
+}
+
+choose_create_driver() {
+  if [ -n "$CREATE_DRIVER" ]; then
+    return 0
+  fi
+  if [ "$ASSUME_YES" = "true" ] || [ "$CREATE_ENCRYPTED" = "true" ]; then
+    CREATE_DRIVER="overlay"
+    return 0
+  fi
+
+  _attachable_note=""
+  if is_true "$ATTACHABLE"; then
+    _attachable_note=", attachable"
+  fi
+
+  {
+    printf "Select driver mode for network '%s':\n" "$CREATE_NETWORK"
+    printf '  [1] overlay            Multi-host Swarm network%s (default)\n' "$_attachable_note"
+    printf '  [2] overlay-encrypted  Overlay with IPsec-encrypted traffic between nodes\n'
+    printf '  [3] overlay-internal   Overlay without external access\n'
+    printf '  [4] bridge             Bridge on each node, no cross-node traffic\n'
+    printf '  [q] Cancel\n'
+  } >&2
+
+  while true; do
+    read_choice "Driver mode [1]: "
+    case "$CHOICE_REPLY" in
+      ""|1|overlay)
+        CREATE_DRIVER="overlay"
+        ;;
+      2|overlay-encrypted)
+        CREATE_DRIVER="overlay"
+        CREATE_ENCRYPTED="true"
+        ;;
+      3|overlay-internal)
+        CREATE_DRIVER="overlay"
+        CREATE_INTERNAL="true"
+        ;;
+      4|bridge)
+        CREATE_DRIVER="bridge"
+        ;;
+      q|Q)
+        info "Cancelled."
+        exit 1
+        ;;
+      *)
+        printf '  Invalid choice: %s\n' "$CHOICE_REPLY" >&2
+        continue
+        ;;
+    esac
+    return 0
+  done
+}
+
+choose_create_size() {
+  if [ -n "$NEW_SUBNET" ]; then
+    resolve_create_subnet "$NEW_SUBNET" || exit 1
+    return 0
+  fi
+  if [ -n "$CREATE_SIZE" ]; then
+    if [ "$CREATE_SIZE" != "auto" ]; then
+      resolve_create_subnet "$CREATE_SIZE" || exit 1
+    fi
+    return 0
+  fi
+  if [ "$ASSUME_YES" = "true" ]; then
+    return 0
+  fi
+
+  {
+    printf "Select subnet size for network '%s':\n" "$CREATE_NETWORK"
+    printf '  [1] auto  %s (default)\n' "$CREATE_AUTO_LABEL"
+    printf '  [2] /24   254 IPs\n'
+    printf '  [3] /23   510 IPs\n'
+    printf '  [4] /22   1022 IPs\n'
+    printf '  [5] /21   2046 IPs\n'
+    printf '  [6] /20   4094 IPs\n'
+    printf '  [7] /16   65534 IPs\n'
+    printf '  Or type a prefix such as /26, or a subnet such as 10.20.0.0/22.\n'
+    printf '  [q] Cancel\n'
+  } >&2
+
+  while true; do
+    read_choice "Subnet size [1]: "
+    case "$CHOICE_REPLY" in
+      ""|1|auto) return 0 ;;
+      2) _size="/24" ;;
+      3) _size="/23" ;;
+      4) _size="/22" ;;
+      5) _size="/21" ;;
+      6) _size="/20" ;;
+      7) _size="/16" ;;
+      q|Q)
+        info "Cancelled."
+        exit 1
+        ;;
+      *) _size="$CHOICE_REPLY" ;;
+    esac
+    if resolve_create_subnet "$_size"; then
+      return 0
+    fi
+  done
+}
+
+create_network() {
+  if [ -z "$CREATE_NETWORK" ]; then
+    err "Missing network name."
+    usage_create
+    exit 1
+  fi
+
+  if network_name_exists "$CREATE_NETWORK"; then
+    info "Network exists: $CREATE_NETWORK"
+    return 0
+  fi
+
+  choose_create_driver
+  case "$CREATE_DRIVER" in
+    overlay|bridge) ;;
+    *)
+      err "Unsupported driver '$CREATE_DRIVER' (use overlay or bridge)."
+      exit 1
+      ;;
+  esac
+  if [ "$CREATE_ENCRYPTED" = "true" ] && [ "$CREATE_DRIVER" != "overlay" ]; then
+    err "--encrypted requires the overlay driver."
+    exit 1
+  fi
+  if [ -n "$NEW_GATEWAY" ] && [ -z "$NEW_SUBNET" ]; then
+    err "--gateway requires --subnet."
+    exit 1
+  fi
+
+  # Overlay needs Swarm. A bridge is made swarm-scoped when Swarm is active so
+  # stack services can attach to it (each node then gets its own local bridge).
+  _swarm_scoped="false"
+  if [ "$CREATE_DRIVER" = "overlay" ]; then
+    ensure_swarm_active
+    _swarm_scoped="true"
+  elif [ "$(to_lower "$(docker info -f '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)")" = "active" ]; then
+    _swarm_scoped="true"
+    # Docker drops a requested subnet for a swarm-scoped bridge; each node takes
+    # one from its local address pools when a task first attaches.
+    if [ -n "$NEW_SUBNET" ] || { [ -n "$CREATE_SIZE" ] && [ "$CREATE_SIZE" != "auto" ]; }; then
+      err "--size/--subnet cannot be used for a swarm-scoped bridge; Docker assigns its subnet on each node."
+      exit 1
+    fi
+    CREATE_SIZE="auto"
+    info "Subnet: assigned by Docker on each node (a swarm-scoped bridge cannot use a fixed subnet)."
+  fi
+
+  load_create_subnet_defaults
+  choose_create_size
+
+  set -- docker network create --driver "$CREATE_DRIVER"
+  if [ "$CREATE_DRIVER" = "bridge" ] && [ "$_swarm_scoped" = "true" ]; then
+    set -- "$@" --scope swarm
+  fi
+  if [ "$_swarm_scoped" = "true" ] && is_true "$ATTACHABLE"; then
+    set -- "$@" --attachable
+  fi
+  if [ "$CREATE_ENCRYPTED" = "true" ]; then
+    set -- "$@" --opt encrypted
+  fi
+  if [ "$CREATE_INTERNAL" = "true" ]; then
+    set -- "$@" --internal
+  fi
+  if [ -n "$NEW_SUBNET" ]; then
+    set -- "$@" --subnet "$NEW_SUBNET"
+  fi
+  if [ -n "$NEW_GATEWAY" ]; then
+    set -- "$@" --gateway "$NEW_GATEWAY"
+  fi
+  set -- "$@" "$CREATE_NETWORK"
+
+  if [ -n "$DRY_RUN" ]; then
+    print_dry_run "$@"
+    return 0
+  fi
+
+  info "Running: $*"
+  "$@" >/dev/null
+  _created_subnet="$(docker network inspect "$CREATE_NETWORK" -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null | sed 's/[[:space:]]*$//' || true)"
+  info "Created network: $CREATE_NETWORK (driver: $CREATE_DRIVER, subnet: ${_created_subnet:-${NEW_SUBNET:-assigned by Docker}})"
+}
+
 parse_ensure_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1486,6 +1855,83 @@ parse_check_subnet_args() {
   done
 }
 
+parse_create_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -v|--verbose)
+        VERBOSE="true"
+        shift
+        ;;
+      -d|--driver)
+        [ $# -ge 2 ] || { err "Missing value for $1"; usage_create; exit 1; }
+        CREATE_DRIVER="$2"
+        shift 2
+        ;;
+      --driver=*)
+        CREATE_DRIVER="${1#*=}"
+        shift
+        ;;
+      -s|--size)
+        [ $# -ge 2 ] || { err "Missing value for $1"; usage_create; exit 1; }
+        CREATE_SIZE="$2"
+        shift 2
+        ;;
+      --size=*)
+        CREATE_SIZE="${1#*=}"
+        shift
+        ;;
+      --subnet)
+        [ $# -ge 2 ] || { err "Missing value for $1"; usage_create; exit 1; }
+        NEW_SUBNET="$2"
+        shift 2
+        ;;
+      --subnet=*)
+        NEW_SUBNET="${1#*=}"
+        shift
+        ;;
+      --gateway)
+        [ $# -ge 2 ] || { err "Missing value for $1"; usage_create; exit 1; }
+        NEW_GATEWAY="$2"
+        shift 2
+        ;;
+      --gateway=*)
+        NEW_GATEWAY="${1#*=}"
+        shift
+        ;;
+      --encrypted)
+        CREATE_ENCRYPTED="true"
+        shift
+        ;;
+      --internal)
+        CREATE_INTERNAL="true"
+        shift
+        ;;
+      --yes)
+        ASSUME_YES="true"
+        shift
+        ;;
+      -h|--help)
+        usage_create
+        exit 0
+        ;;
+      -*)
+        err "Unknown create option: $1"
+        usage_create
+        exit 1
+        ;;
+      *)
+        if [ -n "$CREATE_NETWORK" ]; then
+          err "Unexpected argument: $1"
+          usage_create
+          exit 1
+        fi
+        CREATE_NETWORK="$1"
+        shift
+        ;;
+    esac
+  done
+}
+
 COMMAND="ensure"
 VERBOSE="${VERBOSE:-false}"
 
@@ -1523,6 +1969,10 @@ if [ $# -gt 0 ]; then
       COMMAND="check-subnet"
       shift
       ;;
+    create)
+      COMMAND="create"
+      shift
+      ;;
     --network|--network=*|--subnet|--subnet=*|--new-subnet|--new-subnet=*|--old-network|--old-network=*|--gateway|--gateway=*|--yes|-v|--verbose)
       # Convenience: allow update options without explicit subcommand.
       COMMAND="update"
@@ -1554,6 +2004,13 @@ NEW_GATEWAY=""
 ASSUME_YES="false"
 NETWORK_FILTER_REGEX=".*"
 CHECK_SHOW_USING="false"
+CREATE_NETWORK=""
+CREATE_DRIVER=""
+CREATE_SIZE=""
+CREATE_ENCRYPTED="false"
+CREATE_INTERNAL="false"
+CREATE_POOLS=""
+CREATE_AUTO_LABEL=""
 
 require_docker
 
@@ -1572,6 +2029,11 @@ case "$COMMAND" in
     parse_check_subnet_args "$@"
     enable_verbose_trace
     check_network_subnet_usage
+    ;;
+  create)
+    parse_create_args "$@"
+    enable_verbose_trace
+    create_network
     ;;
   *)
     err "Unknown command: $COMMAND"

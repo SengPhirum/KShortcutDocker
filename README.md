@@ -29,6 +29,21 @@ points to that external resource. For `external: true` resources, a missing
 Docker resource is created with the external name itself, such as
 `POSTGRES_PASSWORD`.
 
+`ksd deploy` also checks every `external: true` network the stack's services
+use (by its `name:` if set, with `${VAR}` / `${VAR:-default}` resolved from the
+environment and `.env`). If the Docker network does not exist yet, it asks for:
+
+- a driver mode: `overlay` (default, attachable), `overlay-encrypted`,
+  `overlay-internal`, or `bridge` (swarm-scoped, one bridge per node)
+- a subnet size: `auto` (Docker assigns it, default), `/24` to `/16`, a custom
+  prefix such as `/26`, or an explicit subnet such as `10.20.0.0/22`. Not asked
+  for a swarm-scoped bridge: Docker assigns its subnet on each node.
+
+For a chosen size it picks the first free subnet of that size from the Swarm
+default address pool, creates the network, and continues the deploy. Choosing `q` cancels the deploy. Without a terminal to ask on, the
+deploy stops instead of guessing; create the network first with
+`ksd network create <name> ... --yes`, which offers the same choices on its own.
+
 `ksd deploy` also supports parent-folder batch deploy mode: if the current
 folder does not contain a compose file, it scans first-level child folders for
 `docker-compose*.yml`, lists the stack names, and lets you deploy one, many, or
@@ -100,7 +115,7 @@ ksd deploy -c <TAB>    # suggest .yml/.yaml files
 ksd deploy --stack <TAB>  # suggest stack names from first-level folders
 ksd log <TAB>          # suggest available services
 ksd log api <TAB>      # suggest common line counts
-ksd network <TAB>      # suggest ensure/update/check and options
+ksd network <TAB>      # suggest create/ensure/update/check and options
 ksd uninstall <TAB>    # suggest --bashrc, --keep-source, -y, --yes, --help
 ```
 
@@ -114,6 +129,8 @@ ksd deploy --stack api --stack worker
 ksd deploy --all
 ksd deploy -c docker-compose.stg.yml
 ksd network ensure -f docker-compose.yml
+ksd network create traefik-public
+ksd network create backend --driver overlay --size /22 --yes
 ksd network update internal-proxy_net --subnet=10.30.0.0/24 --yes
 ksd network check 'proxy|default'
 ksd log api 200

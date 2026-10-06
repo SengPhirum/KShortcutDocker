@@ -12,7 +12,7 @@ Commands:
   deploy    Deploy a Docker Swarm stack from a compose file
   stop      Stop the Docker Swarm stack in the current directory
   log       Tail logs for a service in the current stack
-  network   Ensure, update, or check Docker networks
+  network   Create, ensure, update, or check Docker networks
   update    Update ksd to the latest version
   uninstall Remove ksd and everything install.sh created
 
