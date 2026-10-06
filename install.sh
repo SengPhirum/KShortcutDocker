@@ -2,6 +2,7 @@
 # Install the unified "ksd" command:
 #   ksd config   -> config.sh
 #   ksd deploy   -> deploy.sh
+#   ksd status   -> status.sh
 #   ksd stop     -> stop.sh
 #   ksd log      -> log.sh
 #   ksd network  -> network.sh
@@ -184,6 +185,7 @@ require_script() {
 require_script "ksd.sh"
 require_script "config.sh"
 require_script "deploy.sh"
+require_script "status.sh"
 require_script "stop.sh"
 require_script "log.sh"
 require_script "network.sh"
@@ -429,6 +431,29 @@ _ksd_uninstall_completion() {
   esac
 }
 
+_ksd_status_completion() {
+  local cur prev services
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  case "$prev" in
+    -n|--logs)
+      COMPREPLY=( $(compgen -W "0 5 10 20 50" -- "$cur") )
+      return 0
+      ;;
+  esac
+
+  case "$cur" in
+    -*)
+      _ksd_match_words "$cur" -n --logs -h --help
+      return 0
+      ;;
+  esac
+
+  services="$(_ksd_list_services)"
+  COMPREPLY=( $(compgen -W "$services" -- "$cur") )
+}
+
 _ksd_log_completion() {
   local cur services
   cur="${COMP_WORDS[COMP_CWORD]}"
@@ -634,7 +659,7 @@ _ksd_completion() {
   fi
 
   if [ "$COMP_CWORD" -eq 1 ]; then
-    _ksd_match_words "$cur" config deploy stop log network update uninstall -h --help
+    _ksd_match_words "$cur" config deploy status stop log network update uninstall -h --help
     return 0
   fi
 
@@ -642,6 +667,9 @@ _ksd_completion() {
   case "$subcmd" in
     deploy)
       _ksd_deploy_completion
+      ;;
+    status)
+      _ksd_status_completion
       ;;
     config)
       _ksd_config_completion

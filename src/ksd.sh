@@ -10,6 +10,7 @@ Usage: ksd <command> [options]
 Commands:
   config    Collect Docker Compose secrets and write them to ./secrets
   deploy    Deploy a Docker Swarm stack from a compose file
+  status    Show service status of the current stack, with task errors
   stop      Stop the Docker Swarm stack in the current directory
   log       Tail logs for a service in the current stack
   network   Create, ensure, update, or check Docker networks
@@ -32,6 +33,9 @@ case "$cmd" in
     ;;
   deploy)
     exec sh "$SCRIPT_DIR/deploy.sh" "$@"
+    ;;
+  status)
+    exec sh "$SCRIPT_DIR/status.sh" "$@"
     ;;
   stop)
     exec sh "$SCRIPT_DIR/stop.sh" "$@"

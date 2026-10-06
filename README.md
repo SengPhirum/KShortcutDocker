@@ -4,6 +4,7 @@ Reusable Docker Swarm stack scripts behind a single global command, `ksd`:
 
 - `ksd config`  -> `config.sh`
 - `ksd deploy`  -> `deploy.sh`
+- `ksd status`  -> `status.sh`
 - `ksd stop`    -> `stop.sh`
 - `ksd log`     -> `log.sh`
 - `ksd network` -> `network.sh`
@@ -48,6 +49,37 @@ deploy stops instead of guessing; create the network first with
 folder does not contain a compose file, it scans first-level child folders for
 `docker-compose*.yml`, lists the stack names, and lets you deploy one, many, or
 all of them sequentially.
+
+`ksd status` lists the stack's services with their mode, replicas, state
+(`running`, `starting`, `failing`, `updating`, `update paused`, `rolled back`,
+`scaled to 0`, ...) and image. For every service that is not healthy it adds
+the details needed to fix it: the full task errors (for example
+`No such image: ...`, `no suitable node (...)` or `task: non-zero exit (1)`),
+the update/rollback message, and the last log lines of the most recent failed
+task (`--logs N` to change, `--logs 0` to skip). `ksd status <service>` shows
+one service with its task history. In a parent folder it checks every
+first-level stack folder, like batch deploy. It exits with status 1 when a
+service needs attention, so it can be used as a check after deploying.
+
+```text
+$ ksd status
+Stack: shop
+SERVICE  MODE        REPLICAS  STATE    IMAGE
+api      replicated  2/2       running  registry.example.com/shop/api:2.4.0
+worker   replicated  0/1       failing  registry.example.com/shop/worker:2.4.0
+
+worker: failing, replicas 0/1
+  TASK      STATE                   NODE    ERROR
+  worker.1  Starting 2 seconds ago  node-2
+  worker.1  Failed 9 seconds ago    node-2  task: non-zero exit (1)
+  (2 older tasks with the same error)
+  Last log lines of worker.1 (failed 9 seconds ago):
+    Connecting to postgres://db:5432/shop
+    Error: connect ECONNREFUSED 10.0.1.5:5432
+  More: ksd log worker
+
+1 of 2 services needs attention.
+```
 
 ## Install
 
@@ -109,10 +141,11 @@ What `install.sh` does:
 ## Autocomplete
 
 ```sh
-ksd <TAB>              # lists: config deploy stop log network update uninstall
+ksd <TAB>              # lists: config deploy status stop log network update uninstall
 ksd deploy <TAB>       # suggest -f, --force, -c, --compose-file, -s, --stack, -a, --all
 ksd deploy -c <TAB>    # suggest .yml/.yaml files
 ksd deploy --stack <TAB>  # suggest stack names from first-level folders
+ksd status <TAB>       # suggest available services, -n/--logs
 ksd log <TAB>          # suggest available services
 ksd log api <TAB>      # suggest common line counts
 ksd network <TAB>      # suggest create/ensure/update/check and options
@@ -128,6 +161,8 @@ ksd deploy
 ksd deploy --stack api --stack worker
 ksd deploy --all
 ksd deploy -c docker-compose.stg.yml
+ksd status
+ksd status worker --logs 20
 ksd network ensure -f docker-compose.yml
 ksd network create traefik-public
 ksd network create backend --driver overlay --size /22 --yes
