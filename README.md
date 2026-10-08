@@ -4,7 +4,9 @@ Reusable Docker Swarm stack scripts behind a single global command, `ksd`:
 
 - `ksd config`  -> `config.sh`
 - `ksd deploy`  -> `deploy.sh`
+- `ksd redeploy` -> `deploy.sh --redeploy`
 - `ksd status`  -> `status.sh`
+- `ksd restart` -> `restart.sh`
 - `ksd stop`    -> `stop.sh`
 - `ksd log`     -> `log.sh`
 - `ksd network` -> `network.sh`
@@ -49,6 +51,23 @@ deploy stops instead of guessing; create the network first with
 folder does not contain a compose file, it scans first-level child folders for
 `docker-compose*.yml`, lists the stack names, and lets you deploy one, many, or
 all of them sequentially.
+
+`ksd redeploy` stops the stack and deploys it again. It accepts the same
+options as `ksd deploy` (including batch mode) and runs the same checks and
+prompts first, so the running stack is left alone if a check fails or you
+cancel. Then it runs `docker stack rm`, waits until the old stack's tasks have
+stopped and its networks are removed (up to 120 seconds; deploying earlier
+fails with `network ... not found`), waits 5 more seconds (`--wait N` to
+change), and deploys. In batch mode each stack is stopped right before its own
+deploy, so only one stack is down at a time.
+
+`ksd restart` restarts services without removing the stack: it runs
+`docker service update --force` for each service, which replaces the service's
+tasks with new ones using the same image and settings, following the service's
+`update_config` (rolling, one task at a time by default). With no arguments it
+restarts every service of the stack one after another; `ksd restart api worker`
+restarts only those. Each restart waits until the service has converged, and
+the command exits with status 1 if any of them failed.
 
 `ksd status` lists the stack's services with their mode, replicas, state
 (`running`, `starting`, `failing`, `updating`, `update paused`, `rolled back`,
@@ -141,11 +160,13 @@ What `install.sh` does:
 ## Autocomplete
 
 ```sh
-ksd <TAB>              # lists: config deploy status stop log network update uninstall
-ksd deploy <TAB>       # suggest -f, --force, -c, --compose-file, -s, --stack, -a, --all
+ksd <TAB>              # lists: config deploy redeploy status restart stop log network update uninstall
+ksd deploy <TAB>       # suggest -f, --force, -c, --compose-file, -s, --stack, -a, --all, -r, --redeploy, -w, --wait
+ksd redeploy <TAB>     # same as deploy
 ksd deploy -c <TAB>    # suggest .yml/.yaml files
 ksd deploy --stack <TAB>  # suggest stack names from first-level folders
 ksd status <TAB>       # suggest available services, -n/--logs
+ksd restart <TAB>      # suggest available services
 ksd log <TAB>          # suggest available services
 ksd log api <TAB>      # suggest common line counts
 ksd network <TAB>      # suggest create/ensure/update/check and options
@@ -161,8 +182,13 @@ ksd deploy
 ksd deploy --stack api --stack worker
 ksd deploy --all
 ksd deploy -c docker-compose.stg.yml
+ksd redeploy
+ksd redeploy --wait 10
+ksd redeploy --stack api --stack worker
 ksd status
 ksd status worker --logs 20
+ksd restart
+ksd restart api worker
 ksd network ensure -f docker-compose.yml
 ksd network create traefik-public
 ksd network create backend --driver overlay --size /22 --yes

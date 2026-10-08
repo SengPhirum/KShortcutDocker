@@ -2,7 +2,9 @@
 # Install the unified "ksd" command:
 #   ksd config   -> config.sh
 #   ksd deploy   -> deploy.sh
+#   ksd redeploy -> deploy.sh --redeploy
 #   ksd status   -> status.sh
+#   ksd restart  -> restart.sh
 #   ksd stop     -> stop.sh
 #   ksd log      -> log.sh
 #   ksd network  -> network.sh
@@ -186,6 +188,7 @@ require_script "ksd.sh"
 require_script "config.sh"
 require_script "deploy.sh"
 require_script "status.sh"
+require_script "restart.sh"
 require_script "stop.sh"
 require_script "log.sh"
 require_script "network.sh"
@@ -333,8 +336,14 @@ _ksd_complete_networks_equals() {
 
 _ksd_deploy_completion() {
   local cur prev
-  local -a option_words
-  option_words=(-f --force -c --compose-file -s --stack -a --all -h --help)
+  local -a option_words long_words
+  option_words=(-f --force -c --compose-file -s --stack -a --all -w --wait -h --help)
+  long_words=(--force --compose-file --stack --all --wait --help)
+  # "ksd redeploy" already implies --redeploy.
+  if [ "${COMP_WORDS[1]}" = "deploy" ]; then
+    option_words+=(-r --redeploy)
+    long_words+=(--redeploy)
+  fi
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
@@ -345,6 +354,10 @@ _ksd_deploy_completion() {
       ;;
     -s|--stack)
       _ksd_complete_stack_name "$cur"
+      return 0
+      ;;
+    -w|--wait)
+      COMPREPLY=( $(compgen -W "0 5 10 30" -- "$cur") )
       return 0
       ;;
   esac
@@ -361,7 +374,7 @@ _ksd_deploy_completion() {
       return 0
       ;;
     --*)
-      _ksd_match_words "$cur" --force --compose-file --stack --all --help
+      _ksd_match_words "$cur" "${long_words[@]}"
       return 0
       ;;
     -*)
@@ -446,6 +459,21 @@ _ksd_status_completion() {
   case "$cur" in
     -*)
       _ksd_match_words "$cur" -n --logs -h --help
+      return 0
+      ;;
+  esac
+
+  services="$(_ksd_list_services)"
+  COMPREPLY=( $(compgen -W "$services" -- "$cur") )
+}
+
+_ksd_restart_completion() {
+  local cur services
+  cur="${COMP_WORDS[COMP_CWORD]}"
+
+  case "$cur" in
+    -*)
+      _ksd_match_words "$cur" -h --help
       return 0
       ;;
   esac
@@ -659,17 +687,20 @@ _ksd_completion() {
   fi
 
   if [ "$COMP_CWORD" -eq 1 ]; then
-    _ksd_match_words "$cur" config deploy status stop log network update uninstall -h --help
+    _ksd_match_words "$cur" config deploy redeploy status restart stop log network update uninstall -h --help
     return 0
   fi
 
   subcmd="${COMP_WORDS[1]}"
   case "$subcmd" in
-    deploy)
+    deploy|redeploy)
       _ksd_deploy_completion
       ;;
     status)
       _ksd_status_completion
+      ;;
+    restart)
+      _ksd_restart_completion
       ;;
     config)
       _ksd_config_completion

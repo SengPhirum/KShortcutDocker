@@ -12,16 +12,25 @@ DISCOVERED_STACK_DIRS=""
 SELECTED_STACK_DIRS=""
 RESOLVED_COMPOSE_FILE=""
 RESOLVED_MODE_LABEL=""
+REDEPLOY=0
+REDEPLOY_WAIT=5
+REDEPLOY_WAIT_SET=0
+# Upper bound for waiting on the old stack's tasks and networks to go away.
+STACK_REMOVAL_TIMEOUT=120
+COMMAND_NAME="deploy"
 
 print_help() {
   cat <<EOF
-Usage: $0 [options]
+Usage: ksd $COMMAND_NAME [options]
 
 Options:
   -f, --force               Always resolve image on deploy
   -c, --compose-file FILE   Compose file to use
   -s, --stack NAME          Deploy a first-level stack by folder name (repeatable)
   -a, --all                 Deploy all first-level stacks found under current folder
+  -r, --redeploy            Stop the stack first, then deploy it again (= ksd redeploy)
+  -w, --wait SECONDS        Redeploy: seconds to wait after the old stack is
+                            removed, before deploying (default: $REDEPLOY_WAIT)
   -h, --help                Show this help
 
 Behavior:
@@ -30,6 +39,10 @@ Behavior:
     lets you select stack names, then runs batch deploy sequentially.
   - Before deploying, checks the 'external: true' networks used by the stack;
     a missing one is created after asking for its driver mode and subnet size.
+  - Redeploy runs the same checks first, then stops the stack ('docker stack rm'),
+    waits until its tasks and networks are gone (up to ${STACK_REMOVAL_TIMEOUT}s), waits
+    --wait seconds more, and deploys. In batch mode each stack is stopped right
+    before its own deploy.
 EOF
 }
 
@@ -1014,6 +1027,69 @@ $external_networks
 EOF
 }
 
+plural() {
+  if [ "$1" -eq 1 ]; then
+    printf '%s %s' "$1" "$2"
+  else
+    printf '%s %ss' "$1" "$2"
+  fi
+}
+
+# Prints what is left of a stack being removed, such as "2 tasks, 1 network":
+# tasks still running (or starting) and the stack's own networks. Prints
+# nothing once the stack is gone.
+stack_leftovers() {
+  stack_name="$1"
+
+  task_count="$(docker stack ps "$stack_name" --format '{{.CurrentState}}' 2>/dev/null \
+    | awk '/^(New|Pending|Assigned|Accepted|Preparing|Ready|Starting|Running)/ { count++ } END { print count + 0 }')"
+  network_count="$(docker network ls -q --filter "label=com.docker.stack.namespace=$stack_name" 2>/dev/null \
+    | awk 'NF { count++ } END { print count + 0 }')"
+
+  leftovers=""
+  if [ "$task_count" -gt 0 ]; then
+    leftovers="$(plural "$task_count" task)"
+  fi
+  if [ "$network_count" -gt 0 ]; then
+    leftovers="${leftovers:+$leftovers, }$(plural "$network_count" network)"
+  fi
+  printf '%s' "$leftovers"
+}
+
+# docker stack rm returns before the stack is gone: its tasks keep running
+# until they stop, and its networks are removed after that. Deploying in that
+# window fails with "network ... not found", so wait for both.
+stop_stack_for_redeploy() {
+  stack_name="$1"
+
+  echo "Stopping stack '$stack_name' before deploying it again."
+  if ! docker stack rm "$stack_name"; then
+    echo "Warning: 'docker stack rm $stack_name' reported errors; continuing with the deploy." >&2
+  fi
+
+  started_at="$(date +%s)"
+  waited=0
+  last_leftovers=""
+  while leftovers="$(stack_leftovers "$stack_name")" && [ -n "$leftovers" ]; do
+    if [ "$waited" -ge "$STACK_REMOVAL_TIMEOUT" ]; then
+      echo "Warning: stack '$stack_name' still has $leftovers left after ${waited}s; deploying anyway." >&2
+      break
+    fi
+    if [ "$leftovers" != "$last_leftovers" ]; then
+      echo "Waiting for stack '$stack_name' to be removed ($leftovers left)..."
+      last_leftovers="$leftovers"
+    fi
+    sleep 1
+    waited=$(( $(date +%s) - started_at ))
+  done
+  [ -n "$leftovers" ] || echo "Stack '$stack_name' is removed (after ${waited}s)."
+
+  if [ "$REDEPLOY_WAIT" -gt 0 ]; then
+    echo "Waiting ${REDEPLOY_WAIT}s before deploying..."
+    sleep "$REDEPLOY_WAIT"
+  fi
+}
+
 deploy_stack_dir() {
   target_dir="$1"
   stack_name="$(basename "$target_dir")"
@@ -1048,6 +1124,12 @@ deploy_stack_dir() {
     ensure_external_networks "$RESOLVED_COMPOSE_FILE"
     prepare_compose_for_deploy "$RESOLVED_COMPOSE_FILE" "$stack_name"
 
+    # Stop only after the checks and prompts above, so a cancelled or failed
+    # preflight leaves the running stack untouched.
+    if [ "$REDEPLOY" -eq 1 ]; then
+      stop_stack_for_redeploy "$stack_name"
+    fi
+
     if [ -n "$RESOLVE_IMAGE" ]; then
       echo "Running: docker stack deploy -c $PREPARED_COMPOSE_FILE $stack_name --detach=false --with-registry-auth $RESOLVE_IMAGE"
       docker stack deploy \
@@ -1074,7 +1156,11 @@ deploy_selected_stack_dirs() {
   while IFS= read -r stack_dir; do
     [ -n "$stack_dir" ] || continue
     current_index=$((current_index + 1))
-    echo "[$current_index/$total_selected] Deploying stack '$(basename "$stack_dir")'"
+    if [ "$REDEPLOY" -eq 1 ]; then
+      echo "[$current_index/$total_selected] Redeploying stack '$(basename "$stack_dir")'"
+    else
+      echo "[$current_index/$total_selected] Deploying stack '$(basename "$stack_dir")'"
+    fi
     deploy_stack_dir "$stack_dir"
   done <<EOF
 $SELECTED_STACK_DIRS
@@ -1107,6 +1193,25 @@ while [ $# -gt 0 ]; do
       DEPLOY_ALL=1
       shift
       ;;
+    -r|--redeploy)
+      REDEPLOY=1
+      COMMAND_NAME="redeploy"
+      shift
+      ;;
+    -w|--wait)
+      if [ $# -lt 2 ]; then
+        echo "Error: $1 requires a number of seconds."
+        exit 2
+      fi
+      REDEPLOY_WAIT="$2"
+      REDEPLOY_WAIT_SET=1
+      shift 2
+      ;;
+    --wait=*)
+      REDEPLOY_WAIT="${1#*=}"
+      REDEPLOY_WAIT_SET=1
+      shift
+      ;;
     -h|--help)
       print_help
       exit 0
@@ -1121,6 +1226,18 @@ done
 
 if [ "$DEPLOY_ALL" -eq 1 ] && [ -n "$REQUESTED_STACKS" ]; then
   echo "Error: --all cannot be combined with --stack."
+  exit 2
+fi
+
+case "$REDEPLOY_WAIT" in
+  ''|*[!0-9]*)
+    echo "Error: --wait needs a number of seconds, got '$REDEPLOY_WAIT'."
+    exit 2
+    ;;
+esac
+
+if [ "$REDEPLOY_WAIT_SET" -eq 1 ] && [ "$REDEPLOY" -eq 0 ]; then
+  echo "Error: --wait only applies to a redeploy (ksd redeploy or --redeploy)."
   exit 2
 fi
 
